@@ -94,11 +94,49 @@ class PDFScriptingManager {
       pdfDocument.getJSActions(),
     ]);
 
-    if (!objects && !docActions) {
-      // No FieldObjects or JavaScript actions were found in the document.
-      await this.#destroyScripting();
-      return;
+    // --- BEGIN: comprobación robusta de formularios en páginas ---
+    // Si no hay FieldObjects ni doc-level JS, comprobamos si hay campos
+    // (widgets) o acciones JS dentro de anotaciones en *cualquier* página.
+    let hasPageJSActions = false;
+    let hasFormWidgets = false;
+    if (!objects && !docActions && !hasFormWidgets && !hasPageJSActions) {
+      try {
+        const numPages = pdfDocument.numPages;
+        for (let i = 1; i <= numPages; i++) {
+          if (pdfDocument !== this.#pdfDocument) {
+            break; // documento cambiado/cerrado durante la comprobación
+          }
+          const page = await pdfDocument.getPage(i);
+          // getAnnotations devuelve las anotaciones; esto es más fiable para detectar widgets.
+          const annots = await page.getAnnotations({ intent: "display" });
+          if (!annots || !annots.length) {
+            continue;
+          }
+          for (const annot of annots) {
+            // Detectamos widgets / campos de formulario aunque no tengan valor.
+            if (annot.subtype === "Widget" || annot.fieldName || annot.fieldType) {
+              hasFormWidgets = true;
+              console.log("PDFScriptingManager: found form widget on page", i, annot);
+              break;
+            }
+            // Algunas anotaciones pueden tener acciones JS incrustadas.
+            // Dependiendo de la versión, la propiedad puede llamarse `actions`, `action`,
+            // o las acciones pueden aparecer en `annot.AA` en el objeto crudo.
+            if (annot.actions || annot.action || annot.AA || annot.A) {
+              hasPageJSActions = true;
+              console.log("PDFScriptingManager: found JS action on annotation page", i, annot);
+              break;
+            }
+          }
+          if (hasFormWidgets || hasPageJSActions) {
+            break; // salida temprana al encontrar algo relevante
+          }
+        }
+      } catch (e) {
+        console.error("Error comprobando anotaciones de página para detectar formularios/JS:", e);
+      }
     }
+
     if (pdfDocument !== this.#pdfDocument) {
       return; // The document was closed while the data resolved.
     }
@@ -178,7 +216,7 @@ class PDFScriptingManager {
       }
 
       await this.#scripting.createSandbox({
-        objects,
+        objects: objects || {},
         calculationOrder,
         appInfo: {
           platform: navigator.platform,
