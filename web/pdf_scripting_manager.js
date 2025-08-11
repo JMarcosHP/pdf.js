@@ -94,137 +94,6 @@ class PDFScriptingManager {
       pdfDocument.getJSActions(),
     ]);
 
-    // Escaneo robusto para detectar TODOS los widgets/acciones en el documento
-    async function scanDocumentForWidgetsAndJS(
-      pdfDocument,
-      abortCheck = () => false
-    ) {
-      const found = {
-        pages: [],
-        totalAnnots: 0,
-        totalWidgets: 0,
-        totalJSActions: 0,
-      };
-      const numPages = pdfDocument.numPages || 0;
-
-      // Control de concurrencia para no reventar memoria en PDFs muy grandes.
-      const CONCURRENCY = 8; // ajústalo si quieres más/menos concurrencia
-
-      for (let i = 1; i <= numPages; i += CONCURRENCY) {
-        if (abortCheck && abortCheck()) {
-          break;
-        }
-        const batchPromises = [];
-        const end = Math.min(numPages, i + CONCURRENCY - 1);
-        for (let p = i; p <= end; p++) {
-          batchPromises.push(
-            (async pageNum => {
-              try {
-                const page = await pdfDocument.getPage(pageNum);
-                // Prueba sin intent y con intent: 'display' para comparar.
-                let annots = [];
-                try {
-                  annots = await page.getAnnotations({ intent: "display" });
-                } catch {
-                  // fallback a llamarlo sin opciones si la versión de PDF.js no soporta intent
-                  try {
-                    annots = await page.getAnnotations();
-                  } catch (ee) {
-                    console.error(
-                      "getAnnotations fallback failed on page",
-                      pageNum,
-                      ee
-                    );
-                    annots = [];
-                  }
-                }
-                return { pageNum, annots };
-              } catch (e) {
-                console.error(
-                  "Error getting page/annotations for page",
-                  pageNum,
-                  e
-                );
-                return { pageNum, annots: [] };
-              }
-            })(p)
-          );
-        }
-
-        const results = await Promise.all(batchPromises);
-        for (const { pageNum, annots } of results) {
-          if (!annots || annots.length === 0) {
-            found.pages.push({
-              pageNum,
-              annotsCount: 0,
-              widgets: [],
-              jsActions: [],
-            });
-            continue;
-          }
-          const widgets = [];
-          const jsActions = [];
-          for (const annot of annots) {
-            found.totalAnnots++;
-            // Detección flexible de widget / field:
-            const isWidget =
-              annot.subtype === "Widget" ||
-              Boolean(annot.fieldName) ||
-              Boolean(annot.fieldType) ||
-              Boolean(annot.fullName) ||
-              /widget/i.test(String(annot.subtype || ""));
-
-            // Detección flexible de JS/acciones:
-            const hasJS =
-              Boolean(annot.actions || annot.action || annot.AA || annot.A) ||
-              /javascript|calculate|calc|AA|JS/i.test(
-                JSON.stringify(annot || "")
-              );
-
-            if (isWidget) {
-              widgets.push({
-                id: annot.id ?? null,
-                subtype: annot.subtype ?? null,
-                fieldName:
-                  annot.fieldName ?? annot.fullName ?? annot.name ?? null,
-                keys: Object.keys(annot),
-                raw: (() => {
-                  try {
-                    return JSON.stringify(annot).slice(0, 800); // corta para logs
-                  } catch {
-                    return "[non-serializable]";
-                  }
-                })(),
-              });
-            }
-            if (hasJS) {
-              jsActions.push({
-                id: annot.id ?? null,
-                keys: Object.keys(annot),
-                sample: (() => {
-                  try {
-                    return JSON.stringify(annot).slice(0, 800);
-                  } catch {
-                    return "[non-serializable]";
-                  }
-                })(),
-              });
-            }
-          }
-          found.totalWidgets += widgets.length;
-          found.totalJSActions += jsActions.length;
-          found.pages.push({
-            pageNum,
-            annotsCount: annots.length,
-            widgets,
-            jsActions,
-          });
-        }
-      } // fin for pages
-
-      return found;
-    }
-
     const scanResult = await scanDocumentForWidgetsAndJS(
       pdfDocument,
       () => pdfDocument !== this.#pdfDocument
@@ -236,9 +105,15 @@ class PDFScriptingManager {
       totalJSActions: scanResult.totalJSActions,
       samplePages: scanResult.pages.slice(0, 12),
     });
-    // Decide crear el sandbox si hay widgets o jsActions:
+    // Decide whether to create the sandbox if there are widgets or jsActions:
     const hasAnyWidgetsOrJS =
       scanResult.totalWidgets > 0 || scanResult.totalJSActions > 0;
+
+    if (!objects && !docActions && !hasAnyWidgetsOrJS) {
+      // No FieldObjects, no doc-level JS, no widgets, no JS actions.
+      await this.#destroyScripting();
+      return;
+    }
 
     if (pdfDocument !== this.#pdfDocument) {
       return; // The document was closed while the data resolved.
@@ -633,6 +508,134 @@ class PDFScriptingManager {
 
     this.#destroyCapability?.resolve();
   }
+}
+
+// Detect all widgets and JS actions in the PDF document.
+async function scanDocumentForWidgetsAndJS(
+  pdfDocument,
+  abortCheck = () => false
+) {
+  const found = {
+    pages: [],
+    totalAnnots: 0,
+    totalWidgets: 0,
+    totalJSActions: 0,
+  };
+  const numPages = pdfDocument.numPages || 0;
+
+  // Concurrency control for fetching annotations.
+  const CONCURRENCY = 8;
+
+  for (let i = 1; i <= numPages; i += CONCURRENCY) {
+    if (abortCheck && abortCheck()) {
+      break;
+    }
+    const batchPromises = [];
+    const end = Math.min(numPages, i + CONCURRENCY - 1);
+    for (let p = i; p <= end; p++) {
+      batchPromises.push(
+        (async pageNum => {
+          try {
+            const page = await pdfDocument.getPage(pageNum);
+            // Try to get annotations with the 'display' intent first.
+            let annots = [];
+            try {
+              annots = await page.getAnnotations({ intent: "display" });
+            } catch {
+              // Fallback to the default intent.
+              try {
+                annots = await page.getAnnotations();
+              } catch (ee) {
+                console.error(
+                  "getAnnotations fallback failed on page",
+                  pageNum,
+                  ee
+                );
+                annots = [];
+              }
+            }
+            return { pageNum, annots };
+          } catch (e) {
+            console.error(
+              "Error getting page/annotations for page",
+              pageNum,
+              e
+            );
+            return { pageNum, annots: [] };
+          }
+        })(p)
+      );
+    }
+
+    const results = await Promise.all(batchPromises);
+    for (const { pageNum, annots } of results) {
+      if (!annots || annots.length === 0) {
+        found.pages.push({
+          pageNum,
+          annotsCount: 0,
+          widgets: [],
+          jsActions: [],
+        });
+        continue;
+      }
+      const widgets = [];
+      const jsActions = [];
+      for (const annot of annots) {
+        found.totalAnnots++;
+        // Detect widgets based on common properties.
+        const isWidget =
+          annot.subtype === "Widget" ||
+          Boolean(annot.fieldName) ||
+          Boolean(annot.fieldType) ||
+          Boolean(annot.fullName) ||
+          /widget/i.test(String(annot.subtype || ""));
+
+        // Detect JS actions based on common properties.
+        const hasJS =
+          Boolean(annot.actions || annot.action || annot.AA || annot.A) ||
+          /javascript|calculate|calc|AA|JS/i.test(JSON.stringify(annot || ""));
+
+        if (isWidget) {
+          widgets.push({
+            id: annot.id ?? null,
+            subtype: annot.subtype ?? null,
+            fieldName: annot.fieldName ?? annot.fullName ?? annot.name ?? null,
+            keys: Object.keys(annot),
+            raw: (() => {
+              try {
+                return JSON.stringify(annot).slice(0, 800); // corta para logs
+              } catch {
+                return "[non-serializable]";
+              }
+            })(),
+          });
+        }
+        if (hasJS) {
+          jsActions.push({
+            id: annot.id ?? null,
+            keys: Object.keys(annot),
+            sample: (() => {
+              try {
+                return JSON.stringify(annot).slice(0, 800);
+              } catch {
+                return "[non-serializable]";
+              }
+            })(),
+          });
+        }
+      }
+      found.totalWidgets += widgets.length;
+      found.totalJSActions += jsActions.length;
+      found.pages.push({
+        pageNum,
+        annotsCount: annots.length,
+        widgets,
+        jsActions,
+      });
+    }
+  } // End of for loop over pages
+
+  return found;
 }
 
 export { PDFScriptingManager };
