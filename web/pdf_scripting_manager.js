@@ -94,48 +94,151 @@ class PDFScriptingManager {
       pdfDocument.getJSActions(),
     ]);
 
-    // --- BEGIN: comprobación robusta de formularios en páginas ---
-    // Si no hay FieldObjects ni doc-level JS, comprobamos si hay campos
-    // (widgets) o acciones JS dentro de anotaciones en *cualquier* página.
-    let hasPageJSActions = false;
-    let hasFormWidgets = false;
-    if (!objects && !docActions && !hasFormWidgets && !hasPageJSActions) {
-      try {
-        const numPages = pdfDocument.numPages;
-        for (let i = 1; i <= numPages; i++) {
-          if (pdfDocument !== this.#pdfDocument) {
-            break; // documento cambiado/cerrado durante la comprobación
-          }
-          const page = await pdfDocument.getPage(i);
-          // getAnnotations devuelve las anotaciones; esto es más fiable para detectar widgets.
-          const annots = await page.getAnnotations({ intent: "display" });
-          if (!annots || !annots.length) {
+    // Escaneo robusto para detectar TODOS los widgets/acciones en el documento
+    async function scanDocumentForWidgetsAndJS(
+      pdfDocument,
+      abortCheck = () => false
+    ) {
+      const found = {
+        pages: [],
+        totalAnnots: 0,
+        totalWidgets: 0,
+        totalJSActions: 0,
+      };
+      const numPages = pdfDocument.numPages || 0;
+
+      // Control de concurrencia para no reventar memoria en PDFs muy grandes.
+      const CONCURRENCY = 8; // ajústalo si quieres más/menos concurrencia
+
+      for (let i = 1; i <= numPages; i += CONCURRENCY) {
+        if (abortCheck && abortCheck()) {
+          break;
+        }
+        const batchPromises = [];
+        const end = Math.min(numPages, i + CONCURRENCY - 1);
+        for (let p = i; p <= end; p++) {
+          batchPromises.push(
+            (async pageNum => {
+              try {
+                const page = await pdfDocument.getPage(pageNum);
+                // Prueba sin intent y con intent: 'display' para comparar.
+                let annots = [];
+                try {
+                  annots = await page.getAnnotations({ intent: "display" });
+                } catch {
+                  // fallback a llamarlo sin opciones si la versión de PDF.js no soporta intent
+                  try {
+                    annots = await page.getAnnotations();
+                  } catch (ee) {
+                    console.error(
+                      "getAnnotations fallback failed on page",
+                      pageNum,
+                      ee
+                    );
+                    annots = [];
+                  }
+                }
+                return { pageNum, annots };
+              } catch (e) {
+                console.error(
+                  "Error getting page/annotations for page",
+                  pageNum,
+                  e
+                );
+                return { pageNum, annots: [] };
+              }
+            })(p)
+          );
+        }
+
+        const results = await Promise.all(batchPromises);
+        for (const { pageNum, annots } of results) {
+          if (!annots || annots.length === 0) {
+            found.pages.push({
+              pageNum,
+              annotsCount: 0,
+              widgets: [],
+              jsActions: [],
+            });
             continue;
           }
+          const widgets = [];
+          const jsActions = [];
           for (const annot of annots) {
-            // Detectamos widgets / campos de formulario aunque no tengan valor.
-            if (annot.subtype === "Widget" || annot.fieldName || annot.fieldType) {
-              hasFormWidgets = true;
-              console.log("PDFScriptingManager: found form widget on page", i, annot);
-              break;
+            found.totalAnnots++;
+            // Detección flexible de widget / field:
+            const isWidget =
+              annot.subtype === "Widget" ||
+              Boolean(annot.fieldName) ||
+              Boolean(annot.fieldType) ||
+              Boolean(annot.fullName) ||
+              /widget/i.test(String(annot.subtype || ""));
+
+            // Detección flexible de JS/acciones:
+            const hasJS =
+              Boolean(annot.actions || annot.action || annot.AA || annot.A) ||
+              /javascript|calculate|calc|AA|JS/i.test(
+                JSON.stringify(annot || "")
+              );
+
+            if (isWidget) {
+              widgets.push({
+                id: annot.id ?? null,
+                subtype: annot.subtype ?? null,
+                fieldName:
+                  annot.fieldName ?? annot.fullName ?? annot.name ?? null,
+                keys: Object.keys(annot),
+                raw: (() => {
+                  try {
+                    return JSON.stringify(annot).slice(0, 800); // corta para logs
+                  } catch {
+                    return "[non-serializable]";
+                  }
+                })(),
+              });
             }
-            // Algunas anotaciones pueden tener acciones JS incrustadas.
-            // Dependiendo de la versión, la propiedad puede llamarse `actions`, `action`,
-            // o las acciones pueden aparecer en `annot.AA` en el objeto crudo.
-            if (annot.actions || annot.action || annot.AA || annot.A) {
-              hasPageJSActions = true;
-              console.log("PDFScriptingManager: found JS action on annotation page", i, annot);
-              break;
+            if (hasJS) {
+              jsActions.push({
+                id: annot.id ?? null,
+                keys: Object.keys(annot),
+                sample: (() => {
+                  try {
+                    return JSON.stringify(annot).slice(0, 800);
+                  } catch {
+                    return "[non-serializable]";
+                  }
+                })(),
+              });
             }
           }
-          if (hasFormWidgets || hasPageJSActions) {
-            break; // salida temprana al encontrar algo relevante
-          }
+          found.totalWidgets += widgets.length;
+          found.totalJSActions += jsActions.length;
+          found.pages.push({
+            pageNum,
+            annotsCount: annots.length,
+            widgets,
+            jsActions,
+          });
         }
-      } catch (e) {
-        console.error("Error comprobando anotaciones de página para detectar formularios/JS:", e);
-      }
+      } // fin for pages
+
+      return found;
     }
+
+    const scanResult = await scanDocumentForWidgetsAndJS(
+      pdfDocument,
+      () => pdfDocument !== this.#pdfDocument
+    );
+    console.log("PDF scan summary:", {
+      numPages: pdfDocument.numPages,
+      totalAnnots: scanResult.totalAnnots,
+      totalWidgets: scanResult.totalWidgets,
+      totalJSActions: scanResult.totalJSActions,
+      samplePages: scanResult.pages.slice(0, 12),
+    });
+    // Decide crear el sandbox si hay widgets o jsActions:
+    const hasAnyWidgetsOrJS =
+      scanResult.totalWidgets > 0 || scanResult.totalJSActions > 0;
 
     if (pdfDocument !== this.#pdfDocument) {
       return; // The document was closed while the data resolved.
